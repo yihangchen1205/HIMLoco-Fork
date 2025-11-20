@@ -353,17 +353,23 @@ class PyTorchControllerWithJoystick:
         # 应用hip_reduction，与Isaac Gym一致：只对hip关节索引[0, 3, 6, 9]应用
         if self._hip_reduction != 1.0 and len(self._hip_indices) > 0:
             actions_scaled[self._hip_indices] *= self._hip_reduction
+        
+        # 在 refactor 代码中，目标姿态是动作和默认姿态的叠加
         self._target_joint_pos = self._default_angles + actions_scaled
 
     def _compute_torque_command(self, data: mujoco.MjData) -> np.ndarray:
-        """根据当前目标姿态与实际状态计算力矩."""
+        """根据当前目标姿态与实际状态计算力矩 (参考 refactor 代码风格)."""
         joint_pos = data.qpos[self._joint_qpos_indices].astype(np.float32)
         joint_vel = data.qvel[self._joint_qvel_indices].astype(np.float32)
-        pos_err = self._target_joint_pos - joint_pos
-        vel_err = -joint_vel  # 目标速度为0
-        torques = self._kp * pos_err + self._kd * vel_err
+        
+        # PD 控制: Kp * (q_desired - q_current) - Kd * q_dot_current
+        # 在 refactor 代码中，qDes = 0.5 * self.current_actions + self.default_joint_angles
+        # 这里的 self._target_joint_pos 已经包含了 self.default_angles，所以逻辑一致
+        torques = self._kp * (self._target_joint_pos - joint_pos) - self._kd * joint_vel
+
         if self._torque_limit is not None:
             torques = np.clip(torques, -self._torque_limit, self._torque_limit)
+        
         self._last_torque = torques
         return torques
 
@@ -376,45 +382,34 @@ class PyTorchControllerWithJoystick:
         return value + noise
 
     def get_obs(self, data: mujoco.MjData) -> np.ndarray:
-        """构建与训练时完全一致的观测向量 - 固定45维版本."""
-        base_ang_vel = np.asarray(
-            data.cvel[self._base_body_id, 3:], dtype=np.float64
-        )
+        """构建与训练时完全一致的观测向量 (参考 refactor 代码风格)."""
+        # 1. 提取基本状态
+        base_ang_vel = np.asarray(data.cvel[self._base_body_id, 3:], dtype=np.float64)
+        projected_gravity = _project_gravity_to_body(data.xmat[self._base_body_id]).astype(np.float32)
+        joint_pos = data.qpos[self._joint_qpos_indices]
+        joint_vel = data.qvel[self._joint_qvel_indices]
+
+        # 2. 缩放和处理观测组件
         gyro = base_ang_vel.astype(np.float32) * self._obs_scales["ang_vel"]
-        gravity = _project_gravity_to_body(
-            data.xmat[self._base_body_id]
-        ).astype(np.float32)
-        # joint_angles = (
-        #     data.qpos[self._joint_qpos_indices] - self._default_angles
-        # ) * self._obs_scales["dof_pos"]
-        joint_angles = (
-            data.qpos[self._joint_qpos_indices] - self._default_angles
-        ) * self._obs_scales["dof_pos"]
-
-        joint_velocities = data.qvel[self._joint_qvel_indices] * self._obs_scales[
-            "dof_vel"
-        ]
-
-        # 使用固定的控制命令
+        dof_pos_scaled = (joint_pos - self._default_angles) * self._obs_scales["dof_pos"]
+        dof_vel_scaled = joint_vel * self._obs_scales["dof_vel"]
+        
+        # 3. 处理命令
         command = np.clip(self.command, self._command_lower, self._command_upper)
         command_scaled = command * self._command_scale
 
-        # 构建单步观测向量 (45维: 3+3+3+12+12+12)
+        # 4. 构建单步观测向量 (45维: 3+3+3+12+12+12)
         # 注意：与Isaac Gym一致，使用当前动作（self._current_action）而不是last_action
-        obs_list = [
+        single_obs = np.concatenate([
             command_scaled,           # 3维
             gyro,                     # 3维
-            gravity,                  # 3维
-            joint_angles,             # 12维
-            joint_velocities,         # 12维
+            projected_gravity,        # 3维
+            dof_pos_scaled,           # 12维
+            dof_vel_scaled,           # 12维
             self._current_action,     # 12维 - 使用当前动作，与训练时一致
-        ]
-        single_obs = np.concatenate(obs_list).astype(np.float32)
+        ]).astype(np.float32)
 
-        # 维护历史观测缓冲，与训练时相同：最新观测在最前面
-        # 注意：与Isaac Gym和pdandrl.py一致，历史缓冲区初始化为全零
-        # 第一次调用时，历史缓冲区仍然是全零，只有当前观测会被更新
-        # 正常更新：将历史向后移动，新观测放在最前面
+        # 5. 维护历史观测缓冲
         self._obs_history[1:] = self._obs_history[:-1]
         self._obs_history[0] = single_obs
         obs = self._obs_history.reshape(-1).astype(np.float32).copy()
@@ -425,9 +420,9 @@ class PyTorchControllerWithJoystick:
             print("观测组件维度:")
             print(f"  单步 command_scaled: {command_scaled.shape}")
             print(f"  单步 gyro: {gyro.shape}")
-            print(f"  单步 gravity: {gravity.shape}")
-            print(f"  单步 joint_angles: {joint_angles.shape}")
-            print(f"  单步 joint_velocities: {joint_velocities.shape}")
+            print(f"  单步 projected_gravity: {projected_gravity.shape}")
+            print(f"  单步 dof_pos_scaled: {dof_pos_scaled.shape}")
+            print(f"  单步 dof_vel_scaled: {dof_vel_scaled.shape}")
             print(f"  单步 current_action: {self._current_action.shape}")
             print(f"  单步总维度: {single_obs.shape}")
             print(f"  历史长度: {self._history_len}")
@@ -466,6 +461,7 @@ class PyTorchControllerWithJoystick:
 
                     # 使用标准的 RSL-RL 推理方式：act_inference 方法
                     actions = self._policy(obs_torch)
+                    print("action",actions)
                     actions = torch.clip(
                         actions,
                         -self._clip_actions,
@@ -481,6 +477,7 @@ class PyTorchControllerWithJoystick:
                     self._target_joint_pos = self._default_angles.copy()
 
             torque_cmd = self._compute_torque_command(data)
+
             data.ctrl[:] = torque_cmd
 
         except Exception as e:
@@ -553,7 +550,7 @@ def load_callback(model=None, data=None):
 
         # 设置固定命令 [x_vel, y_vel, angular_vel]
         # 例如: [1.0, 0.0, 0.0] 表示向前移动，速度为1.0 m/s
-        fixed_command = np.array([1.0, 0.0, 0.0], dtype=np.float32)  # 静止状态
+        fixed_command = np.array([0.0, 0.0, 0.0], dtype=np.float32)  # 静止状态
         
         policy = PyTorchControllerWithJoystick(
             model=model,
@@ -610,4 +607,4 @@ if __name__ == "__main__":
     finally:
         print("清理资源...")
         # 注意：由于viewer.launch的限制，我们无法直接访问policy对象
-        # 清理工作会在程序退出时自动进行 
+        # 清理工作会在程序退出时自动进行
