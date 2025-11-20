@@ -8,7 +8,6 @@
         <joint damping="2" armature="0.01" frictionloss="0.2" />
         <motor ctrllimited="false" forcelimited="false"/>
 		
-		<!-- <motor ctrlrange="-23.7 23.7"/> -->
 
 		<default class="collision">
 			<geom condim="3" friction="0.6 0.3 0.3" rgba="0.5 0.6 0.7 1" group="3" />

@@ -43,17 +43,21 @@ if RSL_RL_SRC_PATH not in sys.path:
 
 from legged_gym.envs.aliengo.aliengo_config import AlienGoRoughCfg, AlienGoRoughCfgPPO
 from rsl_rl.modules.him_actor_critic import HIMActorCritic
-
+# ALIENGO_XML_PATH = epath.Path(
+#     os.environ.get(
+#         "ALIENGO_XML_PATH",
+#         (_HERE / "aliengo_mj_description-master/xml/scene_mjx_flat_terrain.xml").as_posix(),
+#     )
 ALIENGO_XML_PATH = epath.Path(
     os.environ.get(
         "ALIENGO_XML_PATH",
-        (_HERE / "aliengo_mj_description-master/xml/scene_mjx_flat_terrain.xml").as_posix(),
+        (_HERE / "aliengo_description/scene_mjx_flat_terrain.xml").as_posix(),
     )
 ).expanduser()
 ALIENGO_POLICY_PATH = epath.Path(
     os.environ.get(
         "ALIENGO_POLICY_PATH",
-        (_REPO_ROOT / "legged_gym/logs/Nov19_15-36-27_/model_2040.pt").as_posix(),
+        (_REPO_ROOT / "legged_gym/logs/Nov19_15-36-27_/model_2020.pt").as_posix(),
     )
 ).expanduser()
 
@@ -123,17 +127,45 @@ def _project_gravity_to_body(body_xmat_row: np.ndarray) -> np.ndarray:
     return rot.T @ _GLOBAL_GRAVITY_VECTOR
 
 
-def _swap_leg_groups(values: np.ndarray) -> np.ndarray:
-    """Swap FR<->FL and RR<->RL joint groups to match Isaac Gym ordering."""
-    arr = np.asarray(values, dtype=np.float32)
-    if arr.shape[-1] != 12:
-        raise ValueError(f"Leg swap仅支持12维关节向量，得到形状: {arr.shape}")
-    swapped = arr.copy()
-    swapped[0:3] = arr[3:6]
-    swapped[3:6] = arr[0:3]
-    swapped[6:9] = arr[9:12]
-    swapped[9:12] = arr[6:9]
-    return swapped
+_MUJOCO_LEG_ORDER = ("FR", "FL", "RR", "RL")
+_POLICY_LEG_ORDER = ("FL", "FR", "RL", "RR")
+_LEG_DOF = 3
+
+
+def _reorder_leg_groups(
+    values: np.ndarray,
+    source_order: Sequence[str],
+    target_order: Sequence[str],
+) -> np.ndarray:
+    """Reorder leg joint triplets from source ordering to target ordering."""
+    arr = np.asarray(values)
+    expected_dim = _LEG_DOF * len(source_order)
+    if arr.shape[-1] != expected_dim:
+        raise ValueError(
+            f"关节向量维度应为{expected_dim}，得到形状: {arr.shape}"
+        )
+
+    reordered = np.empty_like(arr)
+    for dst_leg_idx, leg_name in enumerate(target_order):
+        try:
+            src_leg_idx = source_order.index(leg_name)
+        except ValueError as exc:
+            raise ValueError(f"未知的腿部名称: {leg_name}") from exc
+
+        dst_slice = slice(dst_leg_idx * _LEG_DOF, (dst_leg_idx + 1) * _LEG_DOF)
+        src_slice = slice(src_leg_idx * _LEG_DOF, (src_leg_idx + 1) * _LEG_DOF)
+        reordered[..., dst_slice] = arr[..., src_slice]
+    return reordered
+
+
+def _mujoco_to_policy_order(values: np.ndarray) -> np.ndarray:
+    """Convert MuJoCo joint ordering (FR, FL, RR, RL) to policy ordering (FL, FR, RL, RR)."""
+    return _reorder_leg_groups(values, _MUJOCO_LEG_ORDER, _POLICY_LEG_ORDER)
+
+
+def _policy_to_mujoco_order(values: np.ndarray) -> np.ndarray:
+    """Convert policy ordering (FL, FR, RL, RR) back to MuJoCo ordering (FR, FL, RR, RL)."""
+    return _reorder_leg_groups(values, _POLICY_LEG_ORDER, _MUJOCO_LEG_ORDER)
 
 
 def compute_aliengo_joint_metadata(model: mujoco.MjModel):
@@ -205,7 +237,7 @@ class PyTorchControllerWithJoystick:
 
         # 使用训练时相同的默认关节角（MuJoCo顺序）及Isaac顺序
         self._default_angles = default_angles.astype(np.float32)
-        self._default_angles_policy = _swap_leg_groups(self._default_angles)
+        self._default_angles_policy = _mujoco_to_policy_order(self._default_angles)
         self._joint_qpos_indices = joint_qpos_indices
         self._joint_qvel_indices = joint_qvel_indices
         self._actuator_joint_names = list(actuator_joint_names)
@@ -398,7 +430,7 @@ class PyTorchControllerWithJoystick:
 
     def _scale_actions_to_targets(self, actions_policy: np.ndarray) -> None:
         """将策略输出转换为目标关节角."""
-        actions_mujoco = _swap_leg_groups(actions_policy)
+        actions_mujoco = _policy_to_mujoco_order(actions_policy)
         actions_scaled = actions_mujoco * self._action_scale
         # 应用hip_reduction，与Isaac Gym一致：只对hip关节索引[0, 3, 6, 9]应用
         if self._hip_reduction != 1.0 and len(self._hip_indices) > 0:
@@ -489,8 +521,8 @@ class PyTorchControllerWithJoystick:
         projected_gravity = _project_gravity_to_body(data.xmat[self._base_body_id]).astype(np.float32)
         joint_pos = data.qpos[self._joint_qpos_indices].astype(np.float32)
         joint_vel = data.qvel[self._joint_qvel_indices].astype(np.float32)
-        joint_pos_delta_policy = _swap_leg_groups(joint_pos - self._default_angles)
-        joint_vel_policy = _swap_leg_groups(joint_vel)
+        joint_pos_delta_policy = _mujoco_to_policy_order(joint_pos - self._default_angles)
+        joint_vel_policy = _mujoco_to_policy_order(joint_vel)
 
         # 2. 缩放和处理观测组件
         gyro = base_ang_vel.astype(np.float32) * self._obs_scales["ang_vel"]
@@ -611,7 +643,7 @@ def load_callback(model=None, data=None):
             sim_dt = ALIENGO_CFG.sim.dt
             action_scale = ALIENGO_CFG.control.action_scale
             history_len = 6
-            torque_limit = 50.0
+            torque_limit = 100.0
 
 
         env_config = EnvConfig()
@@ -668,8 +700,8 @@ def load_callback(model=None, data=None):
             command_ranges=ALIENGO_COMMAND_RANGES,
             command_scale=ALIENGO_COMMAND_SCALE,
             obs_scales=ALIENGO_OBS_SCALES,
-            kp=env_config.Kp,
-            kd=env_config.Kd,
+            kp=40,
+            kd=2.0,
             hip_reduction=ALIENGO_CFG.control.hip_reduction,
             torque_limit=env_config.torque_limit,
             command_alpha=0.95,
