@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""使用固定命令的PyTorch策略部署到C MuJoCo."""
+"""使用北通遥控器命令的PyTorch策略部署到C MuJoCo."""
 
 from etils import epath
 import mujoco
@@ -23,6 +23,9 @@ import os
 import traceback
 import torch
 from typing import Dict, Optional, Sequence
+import multiprocessing
+import queue
+import time
 
 _HERE = epath.Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent
@@ -81,6 +84,39 @@ ALIENGO_DEFAULT_JOINT_DICT = dict(ALIENGO_CFG.init_state.default_joint_angles)
 _GLOBAL_GRAVITY_VECTOR = np.array([0.0, 0.0, -1.0], dtype=np.float64)
 
 
+def joystick_process(command_queue, status_queue):
+    """在独立进程中运行北通遥控器控制器."""
+    try:
+        sys.path.append('/Users/cyh/Documents/mujoco_playground_fork/mujoco_playground/experimental/sim2sim')
+        from beitong_game import BeitongJoystickController
+
+        print("独立进程: 初始化北通遥控器控制器...")
+        controller = BeitongJoystickController(wait_timeout=10.0)
+        print("独立进程: 北通遥控器初始化成功!")
+
+        status_queue.put("initialized")
+
+        while True:
+            try:
+                controller.update()
+                cmd = controller.get_command()
+
+                try:
+                    command_queue.put(cmd, timeout=0.001)
+                except queue.Full:
+                    pass
+
+                time.sleep(0.02)
+
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                print(f"独立进程遥控器更新错误: {exc}")
+                time.sleep(0.1)
+
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        print(f"独立进程遥控器初始化失败: {exc}")
+        status_queue.put(f"error: {exc}")
+
+
 def _project_gravity_to_body(body_xmat_row: np.ndarray) -> np.ndarray:
     """Project world gravity into the body frame using MuJoCo's xmat slice."""
     rot = np.asarray(body_xmat_row, dtype=np.float64).reshape(3, 3)
@@ -133,7 +169,7 @@ def compute_aliengo_joint_metadata(model: mujoco.MjModel):
 
 
 class PyTorchControllerWithJoystick:
-    """使用固定命令的PyTorch控制器."""
+    """使用北通遥控器命令的PyTorch控制器."""
 
     def __init__(
         self,
@@ -157,7 +193,7 @@ class PyTorchControllerWithJoystick:
         kd: float = 2.0,
         hip_reduction: float = 1.0,
         torque_limit: Optional[float] = None,
-        fixed_command: Optional[np.ndarray] = None,
+        command_alpha: float = 0.8,
     ):
         self._model = model
         self._device = device
@@ -211,21 +247,12 @@ class PyTorchControllerWithJoystick:
         self._vel_scale_y = vel_scale_y
         self._vel_scale_rot = vel_scale_rot
 
-        # 控制命令 - 使用固定命令
-        if fixed_command is not None:
-            fixed_cmd = np.asarray(fixed_command, dtype=np.float32)
-            if fixed_cmd.shape != (3,):
-                raise ValueError(f"fixed_command必须是3维数组 [x_vel, y_vel, angular_vel], 得到形状: {fixed_cmd.shape}")
-            # 截断到有效范围
-            self.command = np.clip(fixed_cmd, self._command_lower, self._command_upper)
-            print(f"使用固定命令: [{self.command[0]:.3f}, {self.command[1]:.3f}, {self.command[2]:.3f}]")
-        else:
-            # 默认静止状态
-            self.command = np.zeros(3, dtype=np.float32)
-            print("使用默认静止命令: [0.0, 0.0, 0.0]")
-        
+        # 控制命令 - 由遥控器驱动
+        self.command = np.zeros(3, dtype=np.float32)
+        self.raw_command = np.zeros(3, dtype=np.float32)
         self.is_locked = False
         self.motor_state = 1
+        self._command_alpha = float(np.clip(command_alpha, 0.0, 1.0))
 
         # 关节目标与力矩相关参数
         self._hip_reduction = hip_reduction
@@ -245,6 +272,14 @@ class PyTorchControllerWithJoystick:
             self._torque_limit = np.full(self._num_dofs, torque_limit, dtype=np.float32)
         else:
             self._torque_limit = None
+
+        # 遥控器进程
+        self._command_queue = None
+        self._status_queue = None
+        self._joystick_process = None
+        self._joystick_initialized = False
+
+        self._init_joystick_process()
 
         # 噪声配置初始化
         self._noise_config = noise_config
@@ -396,6 +431,57 @@ class PyTorchControllerWithJoystick:
                  1) * self._noise_config['level'] * scale
         return value + noise
 
+    def _init_joystick_process(self):
+        """启动独立的北通遥控器进程."""
+        try:
+            print("启动独立的北通遥控器进程...")
+            self._command_queue = multiprocessing.Queue(maxsize=10)
+            self._status_queue = multiprocessing.Queue()
+
+            self._joystick_process = multiprocessing.Process(
+                target=joystick_process,
+                args=(self._command_queue, self._status_queue),
+            )
+            self._joystick_process.start()
+
+            try:
+                status = self._status_queue.get(timeout=15.0)
+                if status == "initialized":
+                    self._joystick_initialized = True
+                    print("北通遥控器进程初始化成功!")
+                else:
+                    print(f"北通遥控器进程初始化失败: {status}")
+            except queue.Empty:
+                print("北通遥控器进程初始化超时")
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            print(f"启动北通遥控器进程失败: {exc}")
+
+    def _update_joystick_command(self):
+        """更新遥控器命令并映射至训练范围."""
+        if not self._joystick_initialized or self._command_queue is None:
+            return
+
+        try:
+            while not self._command_queue.empty():
+                cmd = self._command_queue.get_nowait()
+                self.raw_command[0] = cmd["x_velocity"]
+                self.raw_command[1] = cmd["y_velocity"]
+                self.raw_command[2] = cmd["angular_velocity"]
+                self.is_locked = cmd["is_locked"]
+                self.motor_state = cmd["motor_state"]
+
+            raw = np.clip(self.raw_command, -1.0, 1.0)
+            target_cmd = self._command_mid + 0.5 * raw * self._command_span
+            self.command = (
+                self._command_alpha * self.command
+                + (1.0 - self._command_alpha) * target_cmd
+            )
+            self.command = np.clip(self.command, self._command_lower, self._command_upper)
+        except queue.Empty:
+            pass
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            print(f"更新遥控器命令错误: {exc}")
+
     def get_obs(self, data: mujoco.MjData) -> np.ndarray:
         """构建与训练时完全一致的观测向量 (参考 refactor 代码风格)."""
         # 1. 提取基本状态
@@ -455,6 +541,7 @@ class PyTorchControllerWithJoystick:
 
     def get_control(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """获取控制信号"""
+        self._update_joystick_command()
         self._counter += 1
         run_policy = (self._counter % self._n_substeps) == 0
 
@@ -505,6 +592,9 @@ class PyTorchControllerWithJoystick:
 
     def cleanup(self):
         """清理资源"""
+        if self._joystick_process and self._joystick_process.is_alive():
+            self._joystick_process.terminate()
+            self._joystick_process.join(timeout=2.0)
         print("控制器资源已清理")
 
 
@@ -521,7 +611,7 @@ def load_callback(model=None, data=None):
             sim_dt = ALIENGO_CFG.sim.dt
             action_scale = ALIENGO_CFG.control.action_scale
             history_len = 6
-            torque_limit = 24.0
+            torque_limit = 50.0
 
 
         env_config = EnvConfig()
@@ -565,10 +655,6 @@ def load_callback(model=None, data=None):
         for name, value in zip(actuator_joint_names, default_angles):
             print(f"  {name}: {value:.3f} rad")
 
-        # 设置固定命令 [x_vel, y_vel, angular_vel]
-        # 例如: [1.0, 0.0, 0.0] 表示向前移动，速度为1.0 m/s
-        fixed_command = np.array([0.6, 0.0, 0.0], dtype=np.float32)  # 静止状态
-        
         policy = PyTorchControllerWithJoystick(
             model=model,
             policy_path=ALIENGO_POLICY_PATH.as_posix(),  # PyTorch .pt模型文件
@@ -586,7 +672,7 @@ def load_callback(model=None, data=None):
             kd=env_config.Kd,
             hip_reduction=ALIENGO_CFG.control.hip_reduction,
             torque_limit=env_config.torque_limit,
-            fixed_command=fixed_command,  # 使用固定命令
+            command_alpha=0.95,
         )
 
         mujoco.set_mjcb_control(policy.get_control)
@@ -599,10 +685,10 @@ def load_callback(model=None, data=None):
 
 
 if __name__ == "__main__":
-    print("=== 使用固定命令的机器人仿真 (PyTorch版本) ===")
+    print("=== 北通遥控器控制的机器人仿真 (PyTorch版本) ===")
     print("说明:")
-    print("  使用固定命令控制机器人，命令在代码中设置")
-    print("  可在 load_callback 函数中修改 fixed_command 参数来改变命令")
+    print("  使用北通遥控器控制机器人，命令由用户输入")
+    print("  遥控器逻辑运行在独立进程中，避免阻塞仿真")
     print(
         "  命令范围: "
         f"x[{ALIENGO_COMMAND_RANGES[0][0]}, {ALIENGO_COMMAND_RANGES[0][1]}], "
