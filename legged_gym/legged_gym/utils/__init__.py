@@ -28,8 +28,24 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+import warnings
+
 from .helpers import class_to_dict, get_load_path, get_args, export_policy_as_jit, set_seed, update_class_from_dict
 from .task_registry import task_registry
 from .logger import Logger
-from .math import *
-from .terrain import Terrain
+try:
+    from .terrain import Terrain  # noqa: F401
+except ModuleNotFoundError as exc:
+    Terrain = None
+    warnings.warn(
+        f"Skipping legged_gym Terrain utilities because dependency '{exc.name}' is missing. "
+        "Install Isaac Gym to access terrain helpers."
+    )
+
+try:
+    from .math import *  # noqa: F401,F403
+except ModuleNotFoundError as exc:
+    warnings.warn(
+        f"Skipping legged_gym.utils.math import because dependency '{exc.name}' is missing. "
+        "Install Isaac Gym to access math helpers that rely on it."
+    )

@@ -29,31 +29,71 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 import os
+import warnings
 from datetime import datetime
-from typing import Tuple
-import torch
+from typing import Optional, Tuple
+
 import numpy as np
+import torch
 
 from rsl_rl.env import VecEnv
-from rsl_rl.runners import OnPolicyRunner, HIMOnPolicyRunner
+from rsl_rl.runners import HIMOnPolicyRunner, OnPolicyRunner
 
-from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
-from .helpers import get_args, update_cfg_from_args, class_to_dict, get_load_path, set_seed, parse_sim_params
+from legged_gym import LEGGED_GYM_ENVS_DIR, LEGGED_GYM_ROOT_DIR
+from .helpers import (
+    class_to_dict,
+    get_args,
+    get_load_path,
+    parse_sim_params,
+    set_seed,
+    update_cfg_from_args,
+)
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
+
+_MISSING_SIM_DEP: Optional[str] = None
+try:
+    from legged_gym.envs.base.legged_robot import LeggedRobot
+except ModuleNotFoundError as exc:
+    LeggedRobot = None
+    _MISSING_SIM_DEP = exc.name or "Isaac Gym"
+    warnings.warn(
+        "Isaac Gym runtime is unavailable; legged_gym environments will be "
+        "registered in config-only mode. Install Isaac Gym to run the Isaac "
+        f"simulator-backed tasks (missing dependency '{_MISSING_SIM_DEP}')."
+    )
 
 class TaskRegistry():
     def __init__(self):
         self.task_classes = {}
         self.env_cfgs = {}
         self.train_cfgs = {}
+        self._unavailable_reasons = {}
     
-    def register(self, name: str, task_class: VecEnv, env_cfg: LeggedRobotCfg, train_cfg: LeggedRobotCfgPPO):
+    def register(
+        self,
+        name: str,
+        task_class: Optional[VecEnv],
+        env_cfg: LeggedRobotCfg,
+        train_cfg: LeggedRobotCfgPPO,
+        unavailable_reason: Optional[str] = None,
+    ):
         self.task_classes[name] = task_class
         self.env_cfgs[name] = env_cfg
         self.train_cfgs[name] = train_cfg
+        if unavailable_reason:
+            self._unavailable_reasons[name] = unavailable_reason
+        elif name in self._unavailable_reasons:
+            del self._unavailable_reasons[name]
     
     def get_task_class(self, name: str) -> VecEnv:
-        return self.task_classes[name]
+        task_class = self.task_classes[name]
+        if task_class is None:
+            reason = self._unavailable_reasons.get(name, "missing simulator dependency")
+            raise RuntimeError(
+                f"Task '{name}' cannot be constructed because {reason}. "
+                "Install Isaac Gym to enable this task."
+            )
+        return task_class
     
     def get_cfgs(self, name) -> Tuple[LeggedRobotCfg, LeggedRobotCfgPPO]:
         train_cfg = self.train_cfgs[name]
@@ -156,3 +196,46 @@ class TaskRegistry():
 
 # make global task registry
 task_registry = TaskRegistry()
+
+
+def _register_default_tasks() -> None:
+    """Register built-in legged robot tasks."""
+    try:
+        from legged_gym.envs import (
+            A1RoughCfg,
+            A1RoughCfgPPO,
+            AlienGoRoughCfg,
+            AlienGoRoughCfgPPO,
+            Go1RoughCfg,
+            Go1RoughCfgPPO,
+        )
+    except ModuleNotFoundError as exc:
+        warnings.warn(
+            "Skipping default legged_gym task registration because "
+            f"dependency '{exc.name}' is missing. Config modules remain "
+            "importable."
+        )
+        return
+
+    def _register(name, env_cfg_cls, train_cfg_cls):
+        reason = None
+        if LeggedRobot is None:
+            reason = (
+                f"missing dependency '{_MISSING_SIM_DEP}'"
+                if _MISSING_SIM_DEP
+                else "required simulator dependency is unavailable"
+            )
+        task_registry.register(
+            name=name,
+            task_class=LeggedRobot,
+            env_cfg=env_cfg_cls(),
+            train_cfg=train_cfg_cls(),
+            unavailable_reason=reason,
+        )
+
+    _register("a1", A1RoughCfg, A1RoughCfgPPO)
+    _register("go1", Go1RoughCfg, Go1RoughCfgPPO)
+    _register("aliengo", AlienGoRoughCfg, AlienGoRoughCfgPPO)
+
+
+_register_default_tasks()

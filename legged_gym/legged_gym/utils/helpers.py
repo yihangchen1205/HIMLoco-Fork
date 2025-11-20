@@ -33,8 +33,14 @@ import copy
 import torch
 import numpy as np
 import random
-from isaacgym import gymapi
-from isaacgym import gymutil
+try:
+    from isaacgym import gymapi  # type: ignore
+    from isaacgym import gymutil  # type: ignore
+except ModuleNotFoundError:
+    from . import isaacgym_stub as _isaacgym_stub
+
+    gymapi = _isaacgym_stub.gymapi  # type: ignore
+    gymutil = _isaacgym_stub.gymutil  # type: ignore
 import torch.nn.functional as F
 
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
