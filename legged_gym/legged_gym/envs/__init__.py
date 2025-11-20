@@ -28,17 +28,30 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+import warnings
+
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
-from legged_gym.envs.a1.a1_config import A1RoughCfg, A1RoughCfgPPO
-from .base.legged_robot import LeggedRobot
-from .a1.a1_config import A1RoughCfg, A1RoughCfgPPO
-from legged_gym.envs.go1.go1_config import Go1RoughCfg, Go1RoughCfgPPO
-from legged_gym.envs.aliengo.aliengo_config import AlienGoRoughCfg, AlienGoRoughCfgPPO
 
-import os
+# NOTE:
+# Importing the training environments pulls in isaacgym, which is not strictly
+# required when we only need configuration objects (e.g. for MuJoCo runtime
+# deployment).  To keep config imports usable without isaacgym we gate the
+# heavy legged_robot import behind a try/except block.
+try:
+    from .base.legged_robot import LeggedRobot
+    from .a1.a1_config import A1RoughCfg, A1RoughCfgPPO
+    from .go1.go1_config import Go1RoughCfg, Go1RoughCfgPPO
+    from .aliengo.aliengo_config import AlienGoRoughCfg, AlienGoRoughCfgPPO
+    from legged_gym.utils.task_registry import task_registry
 
-from legged_gym.utils.task_registry import task_registry
-
-task_registry.register( "a1", LeggedRobot, A1RoughCfg(), A1RoughCfgPPO() )
-task_registry.register( "go1", LeggedRobot, Go1RoughCfg(), Go1RoughCfgPPO() )
-task_registry.register( "aliengo", LeggedRobot, AlienGoRoughCfg(), AlienGoRoughCfgPPO() )
+    task_registry.register("a1", LeggedRobot, A1RoughCfg(), A1RoughCfgPPO())
+    task_registry.register("go1", LeggedRobot, Go1RoughCfg(), Go1RoughCfgPPO())
+    task_registry.register("aliengo", LeggedRobot, AlienGoRoughCfg(), AlienGoRoughCfgPPO())
+except ModuleNotFoundError as exc:
+    # Skip task registration if isaacgym (or another hard dependency) is absent.
+    # Config modules remain importable so downstream MuJoCo-only tooling works.
+    warnings.warn(
+        f"Skipping legged_gym task registration because dependency "
+        f"'{exc.name}' is missing. Config modules can still be imported."
+    )
+    LeggedRobot = None

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""使用北通游戏手柄控制的PyTorch策略部署到C MuJoCo - 安全版本."""
+"""使用固定命令的PyTorch策略部署到C MuJoCo."""
 
 from etils import epath
 import mujoco
@@ -20,10 +20,6 @@ import mujoco.viewer as viewer
 import numpy as np
 import sys
 import os
-import threading
-import time
-import multiprocessing
-import queue
 import traceback
 import torch
 from typing import Dict, Optional, Sequence
@@ -90,41 +86,6 @@ def _project_gravity_to_body(body_xmat_row: np.ndarray) -> np.ndarray:
     rot = np.asarray(body_xmat_row, dtype=np.float64).reshape(3, 3)
     return rot.T @ _GLOBAL_GRAVITY_VECTOR
 
-def joystick_process(command_queue, status_queue):
-    """在独立进程中运行游戏手柄控制器"""
-    try:
-        # 在独立进程中导入pygame相关模块
-        sys.path.append('/Users/cyh/Documents/mujoco_playground_fork/mujoco_playground/experimental/sim2sim')
-        from beitong_game import BeitongJoystickController
-        
-        print("独立进程: 正在初始化北通游戏手柄控制器...")
-        controller = BeitongJoystickController(wait_timeout=10.0)
-        print("独立进程: 北通游戏手柄初始化成功!")
-        
-        status_queue.put("initialized")
-        
-        while True:
-            try:
-                controller.update()
-                cmd = controller.get_command()
-                
-                # 发送命令到主进程
-                try:
-                    command_queue.put(cmd, timeout=0.001)
-                except queue.Full:
-                    # 如果队列满了，跳过这次更新
-                    pass
-                
-                time.sleep(0.02)  # 50Hz
-                
-            except Exception as e:
-                print(f"独立进程游戏手柄更新错误: {e}")
-                time.sleep(0.1)
-                
-    except Exception as e:
-        print(f"独立进程游戏手柄初始化失败: {e}")
-        status_queue.put(f"error: {e}")
-
 
 def compute_aliengo_joint_metadata(model: mujoco.MjModel):
     """从AlienGo配置中构造默认关节角以及qpos/qvel索引."""
@@ -159,7 +120,7 @@ def compute_aliengo_joint_metadata(model: mujoco.MjModel):
 
 
 class PyTorchControllerWithJoystick:
-    """带北通游戏手柄控制的PyTorch控制器 - 安全版本."""
+    """使用固定命令的PyTorch控制器."""
 
     def __init__(
         self,
@@ -175,7 +136,6 @@ class PyTorchControllerWithJoystick:
         vel_scale_y: float = 0.8,
         vel_scale_rot: float = 2 * np.pi,
         noise_config: dict = None,
-        command_alpha: float = 0.8,
         device: str = "cpu",
         command_ranges: Optional[np.ndarray] = None,
         command_scale: Optional[np.ndarray] = None,
@@ -184,6 +144,7 @@ class PyTorchControllerWithJoystick:
         kd: float = 2.0,
         hip_reduction: float = 1.0,
         torque_limit: Optional[float] = None,
+        fixed_command: Optional[np.ndarray] = None,
     ):
         self._model = model
         self._device = device
@@ -236,14 +197,21 @@ class PyTorchControllerWithJoystick:
         self._vel_scale_y = vel_scale_y
         self._vel_scale_rot = vel_scale_rot
 
-        # 控制命令 - 初始为静止状态
-        self.command = np.zeros(3, dtype=np.float32)  # [x_vel, y_vel, angular_vel]
-        self.raw_command = np.zeros(3, dtype=np.float32)  # 原始未平滑的命令
+        # 控制命令 - 使用固定命令
+        if fixed_command is not None:
+            fixed_cmd = np.asarray(fixed_command, dtype=np.float32)
+            if fixed_cmd.shape != (3,):
+                raise ValueError(f"fixed_command必须是3维数组 [x_vel, y_vel, angular_vel], 得到形状: {fixed_cmd.shape}")
+            # 截断到有效范围
+            self.command = np.clip(fixed_cmd, self._command_lower, self._command_upper)
+            print(f"使用固定命令: [{self.command[0]:.3f}, {self.command[1]:.3f}, {self.command[2]:.3f}]")
+        else:
+            # 默认静止状态
+            self.command = np.zeros(3, dtype=np.float32)
+            print("使用默认静止命令: [0.0, 0.0, 0.0]")
+        
         self.is_locked = False
         self.motor_state = 1
-        
-        # 命令平滑参数
-        self._command_alpha = command_alpha  # 平滑系数，越大越平滑 (0.0-1.0)
 
         # 关节目标与力矩相关参数
         self._hip_reduction = hip_reduction
@@ -263,15 +231,6 @@ class PyTorchControllerWithJoystick:
             self._torque_limit = np.full(self._num_dofs, torque_limit, dtype=np.float32)
         else:
             self._torque_limit = None
-
-        # 游戏手柄进程间通信
-        self._command_queue = None
-        self._status_queue = None
-        self._joystick_process = None
-        self._joystick_initialized = False
-
-        # 启动游戏手柄进程
-        self._init_joystick_process()
 
         # 噪声配置初始化
         self._noise_config = noise_config
@@ -388,69 +347,6 @@ class PyTorchControllerWithJoystick:
             f"无法在模型中找到名称，已尝试: {', '.join(candidate_names)}"
         )
 
-    def _init_joystick_process(self):
-        """初始化游戏手柄进程"""
-        try:
-            print("启动独立的游戏手柄进程...")
-            self._command_queue = multiprocessing.Queue(maxsize=10)
-            self._status_queue = multiprocessing.Queue()
-            
-            self._joystick_process = multiprocessing.Process(
-                target=joystick_process,
-                args=(self._command_queue, self._status_queue)
-            )
-            self._joystick_process.start()
-            
-            # 等待初始化状态
-            try:
-                status = self._status_queue.get(timeout=15.0)
-                if status == "initialized":
-                    self._joystick_initialized = True
-                    print("游戏手柄进程初始化成功!")
-                else:
-                    print(f"游戏手柄进程初始化失败: {status}")
-                    self._joystick_initialized = False
-            except queue.Empty:
-                print("游戏手柄进程初始化超时")
-                self._joystick_initialized = False
-                
-        except Exception as e:
-            print(f"启动游戏手柄进程失败: {e}")
-            self._joystick_initialized = False
-
-    def _update_joystick_command(self):
-        """更新游戏手柄命令"""
-        if not self._joystick_initialized or self._command_queue is None:
-            return
-        
-        try:
-            # 获取最新的命令（非阻塞）
-            while not self._command_queue.empty():
-                cmd = self._command_queue.get_nowait()
-                # 更新原始命令（-1..1）
-                self.raw_command[0] = cmd['x_velocity']
-                self.raw_command[1] = cmd['y_velocity']
-                self.raw_command[2] = cmd['angular_velocity']
-                self.is_locked = cmd['is_locked']
-                self.motor_state = cmd['motor_state']
-            
-            # 目标命令（映射到训练时的物理范围）
-            raw = np.clip(self.raw_command, -1.0, 1.0)
-            target_cmd = self._command_mid + 0.5 * raw * self._command_span
-            
-            # 平滑处理（指数移动平均）
-            self.command = (
-                self._command_alpha * self.command
-                + (1.0 - self._command_alpha) * target_cmd
-            )
-            
-            # 截断命令到训练时范围
-            self.command = np.clip(self.command, self._command_lower, self._command_upper)
-        except queue.Empty:
-            pass
-        except Exception as e:
-            print(f"更新游戏手柄命令错误: {e}")
-
     def _scale_actions_to_targets(self, actions_np: np.ndarray) -> None:
         """将策略输出转换为目标关节角."""
         actions_scaled = actions_np * self._action_scale
@@ -499,26 +395,9 @@ class PyTorchControllerWithJoystick:
             "dof_vel"
         ]
 
-        # 使用游戏手柄的控制命令
+        # 使用固定的控制命令
         command = np.clip(self.command, self._command_lower, self._command_upper)
         command_scaled = command * self._command_scale
-        
-        # 调试信息：显示原始命令和平滑后命令的对比
-        if hasattr(self, '_debug_counter'):
-            self._debug_counter += 1
-        else:
-            self._debug_counter = 1
-            
-        if self._debug_counter % 50 == 0:  # 每50帧打印一次
-            raw_cmd_scaled = self._command_mid + 0.5 * self.raw_command * self._command_span
-            print(
-                "原始命令(未平滑,已按训练幅值缩放): "
-                f"[{raw_cmd_scaled[0]:.3f}, {raw_cmd_scaled[1]:.3f}, {raw_cmd_scaled[2]:.3f}] "
-                f"-> 平滑+截断后: [{command[0]:.3f}, {command[1]:.3f}, {command[2]:.3f}] "
-                f"(范围: x[{self._command_lower[0]}, {self._command_upper[0]}], "
-                f"y[{self._command_lower[1]}, {self._command_upper[1]}], "
-                f"ω[{self._command_lower[2]}, {self._command_upper[2]}])"
-            )
 
         # 构建单步观测向量 (45维: 3+3+3+12+12+12)
         # 注意：与Isaac Gym一致，使用当前动作（self._current_action）而不是last_action
@@ -564,9 +443,6 @@ class PyTorchControllerWithJoystick:
 
     def get_control(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """获取控制信号"""
-        # 更新游戏手柄命令
-        self._update_joystick_command()
-        
         self._counter += 1
         run_policy = (self._counter % self._n_substeps) == 0
 
@@ -615,9 +491,6 @@ class PyTorchControllerWithJoystick:
 
     def cleanup(self):
         """清理资源"""
-        if self._joystick_process and self._joystick_process.is_alive():
-            self._joystick_process.terminate()
-            self._joystick_process.join(timeout=2.0)
         print("控制器资源已清理")
 
 
@@ -634,6 +507,8 @@ def load_callback(model=None, data=None):
             sim_dt = ALIENGO_CFG.sim.dt
             action_scale = ALIENGO_CFG.control.action_scale
             history_len = 6
+            torque_limit = 24.0
+
 
         env_config = EnvConfig()
         print(f"env_config.Kp: {env_config.Kp}")
@@ -668,7 +543,7 @@ def load_callback(model=None, data=None):
         sim_dt = env_config.sim_dt
         n_substeps = int(round(ctrl_dt / sim_dt))
 
-        # 创建带游戏手柄的PyTorch控制器
+        # 创建PyTorch控制器
         default_angles, joint_qpos_indices, joint_qvel_indices, actuator_joint_names = (
             compute_aliengo_joint_metadata(model)
         )
@@ -676,6 +551,10 @@ def load_callback(model=None, data=None):
         for name, value in zip(actuator_joint_names, default_angles):
             print(f"  {name}: {value:.3f} rad")
 
+        # 设置固定命令 [x_vel, y_vel, angular_vel]
+        # 例如: [1.0, 0.0, 0.0] 表示向前移动，速度为1.0 m/s
+        fixed_command = np.array([1.0, 0.0, 0.0], dtype=np.float32)  # 静止状态
+        
         policy = PyTorchControllerWithJoystick(
             model=model,
             policy_path=ALIENGO_POLICY_PATH.as_posix(),  # PyTorch .pt模型文件
@@ -685,7 +564,6 @@ def load_callback(model=None, data=None):
              actuator_joint_names=actuator_joint_names,
             n_substeps=n_substeps,
             action_scale=env_config.action_scale,
-            command_alpha=0.95,  # 命令平滑系数，可调整 (0.0=无平滑, 1.0=最大平滑)
             device="cpu",  # 可以改为"cuda"如果有GPU
             command_ranges=ALIENGO_COMMAND_RANGES,
             command_scale=ALIENGO_COMMAND_SCALE,
@@ -693,7 +571,8 @@ def load_callback(model=None, data=None):
             kp=env_config.Kp,
             kd=env_config.Kd,
             hip_reduction=ALIENGO_CFG.control.hip_reduction,
-            torque_limit=getattr(env_config, "torque_limit", None),
+            torque_limit=env_config.torque_limit,
+            fixed_command=fixed_command,  # 使用固定命令
         )
 
         mujoco.set_mjcb_control(policy.get_control)
@@ -706,16 +585,12 @@ def load_callback(model=None, data=None):
 
 
 if __name__ == "__main__":
-    print("=== 北通游戏手柄控制的机器人仿真 (PyTorch版本) ===")
-    print("控制说明:")
-    print("  左摇杆: 控制机器人前后左右移动")
-    print("  右摇杆X轴: 控制机器人左右旋转")
-    print("  请确保北通游戏手柄已连接")
-    print("  注意: 游戏手柄在独立进程中运行，避免资源冲突")
-    print("  新功能: 命令平滑 - 减少手柄抖动，提供更流畅的控制体验")
-    print("  平滑系数: 0.95 (可在代码中调整，0.0=无平滑, 1.0=最大平滑)")
+    print("=== 使用固定命令的机器人仿真 (PyTorch版本) ===")
+    print("说明:")
+    print("  使用固定命令控制机器人，命令在代码中设置")
+    print("  可在 load_callback 函数中修改 fixed_command 参数来改变命令")
     print(
-        "  命令截断: "
+        "  命令范围: "
         f"x[{ALIENGO_COMMAND_RANGES[0][0]}, {ALIENGO_COMMAND_RANGES[0][1]}], "
         f"y[{ALIENGO_COMMAND_RANGES[1][0]}, {ALIENGO_COMMAND_RANGES[1][1]}], "
         f"yaw[{ALIENGO_COMMAND_RANGES[2][0]}, {ALIENGO_COMMAND_RANGES[2][1]}]"

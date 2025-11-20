@@ -7,12 +7,15 @@
     <default>
         <joint damping="2" armature="0.01" frictionloss="0.2" />
         <motor ctrllimited="false" forcelimited="false"/>
-	<default class="collision">
-          <geom condim="3" friction="0.6 0.3 0.3" rgba="0.5 0.6 0.7 1" group="0" />
-	</default>
-	<default class="visual">
-          <geom condim="3" type="mesh" group="1" conaffinity="0" contype="0" rgba="0.2 0.2 0.2 1" />
-	</default>
+		
+		<!-- <motor ctrlrange="-23.7 23.7"/> -->
+
+		<default class="collision">
+			<geom condim="3" friction="0.6 0.3 0.3" rgba="0.5 0.6 0.7 1" group="3" />
+		</default>
+		<default class="visual">
+			<geom condim="3" type="mesh" group="1" conaffinity="0" contype="0" rgba="0.2 0.2 0.2 1" />
+		</default>
     </default>
 
     <visual>
@@ -36,7 +39,7 @@
         <light mode="targetbodycom" target="trunk" directional="false" diffuse=".8 .8 .8" specular="0.3 0.3 0.3" pos="0 0 4.0" dir="0 0 -1"/>       
 
 	<!-- trunk -->
-        <body name="trunk" pos="0 0 1.4">
+        <body name="trunk" pos="0 0 0.55">
             <inertial pos="0.00846406 0.00404455 -0.000762916" quat="-3.12625e-05 0.708321 0.00247254 0.705886" mass="9.042" diaginertia="0.174706 0.161175 0.033357" />
             <freejoint name="root"/>
             <geom class="collision" size="0.3235 0.075 0.056" type="box" />
