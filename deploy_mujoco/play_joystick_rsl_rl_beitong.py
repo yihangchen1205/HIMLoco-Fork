@@ -26,6 +26,9 @@ from typing import Dict, Optional, Sequence
 import multiprocessing
 import queue
 import time
+import argparse
+import yaml
+from pathlib import Path
 
 _HERE = epath.Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent
@@ -85,7 +88,21 @@ ALIENGO_OBS_SCALES = {
     "dof_vel": float(ALIENGO_CFG.normalization.obs_scales.dof_vel),
 }
 ALIENGO_DEFAULT_JOINT_DICT = dict(ALIENGO_CFG.init_state.default_joint_angles)
-_GLOBAL_GRAVITY_VECTOR = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+
+# 全局变量用于存储配置
+_GLOBAL_CONFIG = None
+_GLOBAL_POLICY_PATH = None
+_GLOBAL_XML_PATH = None
+
+
+def get_gravity_orientation(quaternion_wxyz: np.ndarray) -> np.ndarray:
+    """四元数 [w,x,y,z] -> 机体坐标系下的重力方向 (3,)"""
+    qw, qx, qy, qz = float(quaternion_wxyz[0]), float(quaternion_wxyz[1]), float(quaternion_wxyz[2]), float(quaternion_wxyz[3])
+    g = np.zeros(3, dtype=np.float32)
+    g[0] = 2.0 * (-qz * qx + qw * qy)
+    g[1] = -2.0 * (qz * qy + qw * qx)
+    g[2] = 1.0 - 2.0 * (qw * qw + qz * qz)
+    return g
 
 
 def joystick_process(command_queue, status_queue):
@@ -121,10 +138,6 @@ def joystick_process(command_queue, status_queue):
         status_queue.put(f"error: {exc}")
 
 
-def _project_gravity_to_body(body_xmat_row: np.ndarray) -> np.ndarray:
-    """Project world gravity into the body frame using MuJoCo's xmat slice."""
-    rot = np.asarray(body_xmat_row, dtype=np.float64).reshape(3, 3)
-    return rot.T @ _GLOBAL_GRAVITY_VECTOR
 
 
 _MUJOCO_LEG_ORDER = ("FR", "FL", "RR", "RL")
@@ -226,6 +239,11 @@ class PyTorchControllerWithJoystick:
         hip_reduction: float = 1.0,
         torque_limit: Optional[float] = None,
         command_alpha: float = 0.8,
+        dof_pos_scale: float = 1.0,
+        dof_vel_scale: float = 0.05,
+        ang_vel_scale: float = 0.25,
+        action_smoothing: float = 0.0,
+        joint2motor_idx: Optional[np.ndarray] = None,
     ):
         self._model = model
         self._device = device
@@ -270,6 +288,35 @@ class PyTorchControllerWithJoystick:
         # 动作记录（使用Isaac Gym的关节顺序，供观测使用）
         self._current_action_policy = np.zeros_like(default_angles, dtype=np.float32)
         self._last_action_policy = np.zeros_like(default_angles, dtype=np.float32)
+        self._action_smoothed = np.zeros_like(default_angles, dtype=np.float32)
+        
+        # 观测缩放参数（从 yaml 配置加载）
+        self._dof_pos_scale = dof_pos_scale
+        self._dof_vel_scale = dof_vel_scale
+        self._ang_vel_scale = ang_vel_scale
+        self._action_smoothing = action_smoothing
+        
+        # 关节到电机的映射（用于观测中的顺序转换）
+        if joint2motor_idx is not None:
+            self._joint2motor_idx = np.array(joint2motor_idx, dtype=np.int32)
+            # 创建反向映射：从电机索引到关节索引
+            # 如果 joint2motor_idx[joint_idx] = motor_idx，则 motor2joint_idx[motor_idx] = joint_idx
+            # 这样可以将按照关节索引顺序的数据转换为按照电机索引顺序
+            self._motor2joint_idx = np.zeros(len(self._joint2motor_idx), dtype=np.int32)
+            for joint_idx, motor_idx in enumerate(self._joint2motor_idx):
+                if 0 <= motor_idx < len(self._motor2joint_idx):
+                    self._motor2joint_idx[motor_idx] = joint_idx
+            print(f"关节到电机映射: {self._joint2motor_idx}")
+            print(f"电机到关节映射: {self._motor2joint_idx}")
+            # 重新排列 default_angles 以匹配观测中的顺序
+            # default_angles 是从 yaml 加载的，可能是按照关节顺序的
+            # 我们需要将其转换为按照电机索引顺序（与 qj 的顺序一致）
+            self._default_angles = self._default_angles[self._motor2joint_idx].copy()
+            print(f"已重新排列 default_angles 以匹配观测顺序")
+        else:
+            # 如果没有提供映射，使用恒等映射
+            self._joint2motor_idx = np.arange(self._num_dofs, dtype=np.int32)
+            self._motor2joint_idx = np.arange(self._num_dofs, dtype=np.int32)
 
         self._counter = 0
         self._n_substeps = n_substeps
@@ -496,8 +543,8 @@ class PyTorchControllerWithJoystick:
         try:
             while not self._command_queue.empty():
                 cmd = self._command_queue.get_nowait()
-                self.raw_command[0] = cmd["x_velocity"]
-                self.raw_command[1] = cmd["y_velocity"]
+                self.raw_command[0] = -cmd["x_velocity"]
+                self.raw_command[1] = -cmd["y_velocity"]
                 self.raw_command[2] = cmd["angular_velocity"]
                 self.is_locked = cmd["is_locked"]
                 self.motor_state = cmd["motor_state"]
@@ -515,61 +562,78 @@ class PyTorchControllerWithJoystick:
             print(f"更新遥控器命令错误: {exc}")
 
     def get_obs(self, data: mujoco.MjData) -> np.ndarray:
-        """构建与训练时完全一致的观测向量 (参考 refactor 代码风格)."""
-        # 1. 提取基本状态
-        base_ang_vel = np.asarray(data.cvel[self._base_body_id, 3:], dtype=np.float64)
-        projected_gravity = _project_gravity_to_body(data.xmat[self._base_body_id]).astype(np.float32)
-        joint_pos = data.qpos[self._joint_qpos_indices].astype(np.float32)
-        joint_vel = data.qvel[self._joint_qvel_indices].astype(np.float32)
-        joint_pos_delta_policy = _mujoco_to_policy_order(joint_pos - self._default_angles)
-        joint_vel_policy = _mujoco_to_policy_order(joint_vel)
-
-        # 2. 缩放和处理观测组件
-        gyro = base_ang_vel.astype(np.float32) * self._obs_scales["ang_vel"]
-        dof_pos_scaled = joint_pos_delta_policy * self._obs_scales["dof_pos"]
-        dof_vel_scaled = joint_vel_policy * self._obs_scales["dof_vel"]
-        
-        # 3. 处理命令
-        command = np.clip(self.command, self._command_lower, self._command_upper)
-        command_scaled = command * self._command_scale
-
-        # 4. 构建单步观测向量 (45维: 3+3+3+12+12+12)
-        # 注意：与Isaac Gym一致，使用当前动作（self._current_action_policy）而不是last_action
-        single_obs = np.concatenate([
-            command_scaled,           # 3维
-            gyro,                     # 3维
-            projected_gravity,        # 3维
-            dof_pos_scaled,           # 12维
-            dof_vel_scaled,           # 12维
-            self._current_action_policy,  # 12维 - 使用当前动作，与训练时一致
-        ]).astype(np.float32)
-
-        # 5. 维护历史观测缓冲
-        self._obs_history[1:] = self._obs_history[:-1]
-        self._obs_history[0] = single_obs
-        obs = self._obs_history.reshape(-1).astype(np.float32).copy()
-        np.clip(obs, -self._clip_obs, self._clip_obs, out=obs)
-
-        # 如果这是第一次调用，打印各组件维度用于调试
-        if not hasattr(self, '_dims_printed'):
-            print("观测组件维度:")
-            print(f"  单步 command_scaled: {command_scaled.shape}")
-            print(f"  单步 gyro: {gyro.shape}")
-            print(f"  单步 projected_gravity: {projected_gravity.shape}")
-            print(f"  单步 dof_pos_scaled: {dof_pos_scaled.shape}")
-            print(f"  单步 dof_vel_scaled: {dof_vel_scaled.shape}")
-            print(f"  单步 current_action: {self._current_action_policy.shape}")
-            print(f"  单步总维度: {single_obs.shape}")
-            print(f"  历史长度: {self._history_len}")
-            print(f"  拼接后观测维度: {obs.shape}")
-            self._dims_printed = True
+        """构建观测向量 - 与 deploy_mujoco_controller.py 完全一致的计算方法"""
+        try:
+            # 提取基本状态 - 直接从 qpos/qvel 索引，与 deploy 一致
+            qj_raw = data.qpos[7:7+self._num_dofs].copy()
+            dqj_raw = data.qvel[6:6+self._num_dofs].copy()
+            quat = data.qpos[3:7].copy()
+            omega = data.qvel[3:6].copy()
             
-        # 验证观测维度
-        assert obs.shape[0] == self._obs_dim, (
-            f"观测维度应该是{self._obs_dim}，但得到了{obs.shape[0]}"
-        )
-
-        return obs
+            # 根据 joint2motor_idx 重新排列关节角度和速度
+            # 从 MuJoCo 的关节顺序转换为策略期望的顺序
+            # motor2joint_idx[j] 表示电机 j 对应的关节索引
+            qj = qj_raw[self._motor2joint_idx].copy()
+            dqj = dqj_raw[self._motor2joint_idx].copy()
+            
+            # 归一化/缩放 - 使用 yaml 配置中的缩放因子
+            qj_n = (qj - self._default_angles) * self._dof_pos_scale
+            dqj_n = dqj * self._dof_vel_scale
+            gravity_orientation = get_gravity_orientation(quat)
+            omega_n = omega * self._ang_vel_scale
+            
+            # 处理命令
+            command_clipped = np.clip(self.command, self._command_lower, self._command_upper)
+            command_scaled = command_clipped * self._command_scale
+            
+            # 确保 action_smoothed 长度正确
+            if self._action_smoothed.size != self._num_dofs:
+                self._action_smoothed = np.zeros(self._num_dofs, dtype=np.float32)
+            
+            # 组装单步观测 (45维: 3+3+3+12+12+12)
+            single_obs = np.concatenate([
+                command_scaled,         # 3维
+                omega_n,                # 3维
+                gravity_orientation,     # 3维
+                qj_n,                   # 12维
+                dqj_n,                  # 12维
+                self._action_smoothed,  # 12维
+            ]).astype(np.float32)
+            
+            if single_obs.size != self._single_obs_dim:
+                raise ValueError(f"观测维度错误: single_obs.size={single_obs.size} != {self._single_obs_dim}")
+            
+            # 维护历史观测缓冲
+            self._obs_history[1:] = self._obs_history[:-1]
+            self._obs_history[0] = single_obs
+            obs = self._obs_history.reshape(-1).astype(np.float32).copy()
+            np.clip(obs, -self._clip_obs, self._clip_obs, out=obs)
+            
+            if obs.size != self._obs_dim:
+                raise ValueError(f"历史观测维度错误: obs.size={obs.size} != {self._obs_dim}")
+            
+            # 如果这是第一次调用，打印各组件维度用于调试
+            if not hasattr(self, '_dims_printed'):
+                print("观测组件维度:")
+                print(f"  单步 command_scaled: {command_scaled.shape}")
+                print(f"  单步 omega_n: {omega_n.shape}")
+                print(f"  单步 gravity_orientation: {gravity_orientation.shape}")
+                print(f"  单步 qj_n: {qj_n.shape}")
+                print(f"  单步 dqj_n: {dqj_n.shape}")
+                print(f"  单步 action_smoothed: {self._action_smoothed.shape}")
+                print(f"  单步总维度: {single_obs.shape}")
+                print(f"  历史长度: {self._history_len}")
+                print(f"  拼接后观测维度: {obs.shape}")
+                self._dims_printed = True
+            
+            return obs
+            
+        except Exception as e:
+            print(f"构建观测失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 返回零观测作为后备
+            return np.zeros(self._obs_dim, dtype=np.float32)
 
     def get_control(self, model: mujoco.MjModel, data: mujoco.MjData) -> None:
         """获取控制信号"""
@@ -582,7 +646,6 @@ class PyTorchControllerWithJoystick:
                 obs = self.get_obs(data)
 
                 if self._counter == self._n_substeps:
-                    print(f"观测向量维度: {obs.shape}")
                     assert obs.shape[0] == self._obs_dim, (
                         f"观测维度不匹配！期望 {self._obs_dim}, "
                         f"得到 {obs.shape[0]}"
@@ -597,17 +660,21 @@ class PyTorchControllerWithJoystick:
 
                     # 使用标准的 RSL-RL 推理方式：act_inference 方法
                     actions = self._policy(obs_torch)
-                    print("action",actions)
                     actions = torch.clip(
                         actions,
                         -self._clip_actions,
                         self._clip_actions,
                     )  # pytype: disable=attribute-error
                     actions_np = actions.cpu().numpy().flatten()
+                    # 动作平滑
+                    if self._action_smoothing > 0.0:
+                        self._action_smoothed = self._action_smoothing * self._action_smoothed + (1.0 - self._action_smoothing) * actions_np
+                    else:
+                        self._action_smoothed = actions_np.copy()
                     # 更新动作历史：当前动作 -> last_action
                     self._last_action_policy = self._current_action_policy.copy()
                     self._current_action_policy = actions_np.copy()
-                    self._scale_actions_to_targets(actions_np)
+                    self._scale_actions_to_targets(self._action_smoothed)
             else:
                 if self.is_locked or self.motor_state == 0:
                     self._target_joint_pos = self._default_angles.copy()
@@ -631,80 +698,107 @@ class PyTorchControllerWithJoystick:
 
 
 def load_callback(model=None, data=None):
-    """加载回调函数"""
+    """加载回调函数 - 使用 yaml 配置"""
+    global _GLOBAL_CONFIG, _GLOBAL_POLICY_PATH, _GLOBAL_XML_PATH  # noqa: PLW0603
+    
     try:
         mujoco.set_mjcb_control(None)
 
-        # 环境配置（无需依赖mujoco_playground）
-        class EnvConfig:
-            Kd = 2.0
-            Kp = 40.0
-            ctrl_dt = ALIENGO_CFG.control.decimation * ALIENGO_CFG.sim.dt
-            sim_dt = ALIENGO_CFG.sim.dt
-            action_scale = ALIENGO_CFG.control.action_scale
-            history_len = 6
-            torque_limit = 100.0
-
-
-        env_config = EnvConfig()
-        print(f"env_config.Kp: {env_config.Kp}")
-        print(f"env_config.Kd: {env_config.Kd}")
-        print(f"env_config.action_scale: {env_config.action_scale}")
-        print(f"env_config.history_len: {env_config.history_len}")
-        print(f"env_config.ctrl_dt: {env_config.ctrl_dt}")
-        print(f"env_config.sim_dt: {env_config.sim_dt}")
-        # exit(0)
-        # print(f"env_config.n_substeps: {env_config.n_substeps}")
-        # 加载模型
-        if not ALIENGO_XML_PATH.exists():
-            raise FileNotFoundError(
-                f"找不到指定的XML场景文件: {ALIENGO_XML_PATH.as_posix()}"
-            )
-
-        model = mujoco.MjModel.from_xml_path(ALIENGO_XML_PATH.as_posix())
-        # 可选择粗糙地形
-        # model = mujoco.MjModel.from_xml_path(
-        #     bk_constants.FEET_ONLY_ROUGH_TERRAIN_XML.as_posix(),
-        #     assets=get_assets(),
-        # )
+        # 从 yaml 配置加载参数
+        config = _GLOBAL_CONFIG
+        policy_path = _GLOBAL_POLICY_PATH
+        xml_path = _GLOBAL_XML_PATH
         
-        # model.dof_damping[6:] = env_config.Kd
-        # model.actuator_gainprm[:, 0] = env_config.Kp
-        # model.actuator_biasprm[:, 1] = -env_config.Kp
+        simulation_dt = float(config["simulation_dt"])
+        control_decimation = int(config["control_decimation"])
+        kps = np.array(config["kps"], dtype=np.float32)
+        kds = np.array(config["kds"], dtype=np.float32)
+        default_angles = np.array(config["default_angles"], dtype=np.float32)
+        dof_pos_scale = float(config.get("dof_pos_scale", 1.0))
+        dof_vel_scale = float(config.get("dof_vel_scale", 0.05))
+        ang_vel_scale = float(config.get("ang_vel_scale", 0.25))
+        action_scale = float(config["action_scale"])
+        action_smoothing = float(config.get("action_smoothing", 0.0))
+        torque_limit = float(config.get("torque_limit", 100.0))
+        joint2motor_idx = config.get("joint2motor_idx", None)
+        if joint2motor_idx is not None:
+            joint2motor_idx = np.array(joint2motor_idx, dtype=np.int32)
+        
+        # 从 yaml 配置读取 cmd_scale，如果不存在则使用默认值
+        cmd_scale = config.get("cmd_scale", None)
+        if cmd_scale is not None:
+            cmd_scale = np.array(cmd_scale, dtype=np.float32)
+            print(f"使用 yaml 配置中的 cmd_scale: {cmd_scale}")
+        else:
+            cmd_scale = ALIENGO_COMMAND_SCALE
+            print(f"使用默认的 ALIENGO_COMMAND_SCALE: {cmd_scale}")
+        
+        print(f"配置参数:")
+        print(f"  simulation_dt: {simulation_dt}")
+        print(f"  control_decimation: {control_decimation}")
+        print(f"  action_scale: {action_scale}")
+        print(f"  dof_pos_scale: {dof_pos_scale}")
+        print(f"  dof_vel_scale: {dof_vel_scale}")
+        print(f"  ang_vel_scale: {ang_vel_scale}")
+        print(f"  cmd_scale: {cmd_scale}")
+        
+        # 加载模型
+        if not Path(xml_path).exists():
+            raise FileNotFoundError(f"找不到指定的XML场景文件: {xml_path}")
+
+        model = mujoco.MjModel.from_xml_path(xml_path)
+        model.opt.timestep = simulation_dt
 
         data = mujoco.MjData(model)
         mujoco.mj_resetDataKeyframe(model, data, 0)
 
-        ctrl_dt = env_config.ctrl_dt
-        sim_dt = env_config.sim_dt
-        n_substeps = int(round(ctrl_dt / sim_dt))
+        ctrl_dt = simulation_dt * control_decimation
+        n_substeps = control_decimation
 
         # 创建PyTorch控制器
-        default_angles, joint_qpos_indices, joint_qvel_indices, actuator_joint_names = (
+        default_angles_from_model, joint_qpos_indices, joint_qvel_indices, actuator_joint_names = (
             compute_aliengo_joint_metadata(model)
         )
-        print("使用AlienGo配置默认关节角:")
-        for name, value in zip(actuator_joint_names, default_angles):
+        
+        # 如果 yaml 中提供了 default_angles，使用 yaml 的；否则使用模型计算的
+        if default_angles.size == len(default_angles_from_model):
+            print("使用 yaml 配置中的默认关节角")
+            default_angles_to_use = default_angles
+        else:
+            print("使用模型计算的默认关节角")
+            default_angles_to_use = default_angles_from_model
+        
+        print("使用默认关节角:")
+        for name, value in zip(actuator_joint_names, default_angles_to_use):
             print(f"  {name}: {value:.3f} rad")
+
+        # 计算平均 kp 和 kd（如果配置中是数组）
+        kp_mean = float(np.mean(kps)) if kps.size > 0 else 40.0
+        kd_mean = float(np.mean(kds)) if kds.size > 0 else 2.0
 
         policy = PyTorchControllerWithJoystick(
             model=model,
-            policy_path=ALIENGO_POLICY_PATH.as_posix(),  # PyTorch .pt模型文件
-            default_angles=default_angles,
+            policy_path=policy_path,
+            default_angles=default_angles_to_use,
             joint_qpos_indices=joint_qpos_indices,
             joint_qvel_indices=joint_qvel_indices,
-             actuator_joint_names=actuator_joint_names,
+            actuator_joint_names=actuator_joint_names,
             n_substeps=n_substeps,
-            action_scale=env_config.action_scale,
-            device="cpu",  # 可以改为"cuda"如果有GPU
+            action_scale=action_scale,
+            device="cpu",
             command_ranges=ALIENGO_COMMAND_RANGES,
-            command_scale=ALIENGO_COMMAND_SCALE,
+            command_scale=cmd_scale,
             obs_scales=ALIENGO_OBS_SCALES,
-            kp=40,
-            kd=2.0,
+            kp=kp_mean,
+            kd=kd_mean,
             hip_reduction=ALIENGO_CFG.control.hip_reduction,
-            torque_limit=env_config.torque_limit,
+            torque_limit=torque_limit,
             command_alpha=0.95,
+            dof_pos_scale=dof_pos_scale,
+            dof_vel_scale=dof_vel_scale,
+            ang_vel_scale=ang_vel_scale,
+            action_smoothing=action_smoothing,
+            joint2motor_idx=joint2motor_idx,
         )
 
         mujoco.set_mjcb_control(policy.get_control)
@@ -717,6 +811,54 @@ def load_callback(model=None, data=None):
 
 
 if __name__ == "__main__":
+    # global _GLOBAL_CONFIG, _GLOBAL_POLICY_PATH, _GLOBAL_XML_PATH  # noqa: PLW0603
+    
+    # 解析命令行参数
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config_file", type=str, nargs="?", default="go2.yaml", 
+                       help="配置文件名（默认: go2.yaml，会在脚本目录查找）")
+    args = parser.parse_args()
+    
+    # 处理配置文件路径
+    cfg_path = args.config_file
+    if not os.path.isabs(cfg_path):
+        # 如果不是绝对路径，先在当前目录查找，再在脚本目录查找
+        if not os.path.exists(cfg_path):
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            cfg_path_in_script_dir = os.path.join(script_dir, cfg_path)
+            if os.path.exists(cfg_path_in_script_dir):
+                cfg_path = cfg_path_in_script_dir
+            else:
+                raise FileNotFoundError(
+                    f"配置文件未找到: {args.config_file}\n"
+                    f"  已尝试: {os.path.abspath(args.config_file)}\n"
+                    f"  已尝试: {cfg_path_in_script_dir}"
+                )
+        else:
+            cfg_path = os.path.abspath(cfg_path)
+    
+    print(f"加载配置文件: {cfg_path}")
+    with open(cfg_path, "r") as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+    
+    # 从配置中提取路径（支持相对路径和绝对路径）
+    policy_path = config["policy_path"]
+    xml_path = config["xml_path"]
+    
+    # 处理相对路径
+    if not os.path.isabs(policy_path):
+        policy_path = os.path.join(_REPO_ROOT.as_posix(), policy_path)
+    if not os.path.isabs(xml_path):
+        xml_path = os.path.join(_REPO_ROOT.as_posix(), xml_path)
+    
+    policy_path = os.path.abspath(policy_path)
+    xml_path = os.path.abspath(xml_path)
+    
+    # 设置全局变量
+    _GLOBAL_CONFIG = config
+    _GLOBAL_POLICY_PATH = policy_path
+    _GLOBAL_XML_PATH = xml_path
+    
     print("=== 北通遥控器控制的机器人仿真 (PyTorch版本) ===")
     print("说明:")
     print("  使用北通遥控器控制机器人，命令由用户输入")
@@ -728,6 +870,8 @@ if __name__ == "__main__":
         f"yaw[{ALIENGO_COMMAND_RANGES[2][0]}, {ALIENGO_COMMAND_RANGES[2][1]}]"
     )
     print("  模型类型: PyTorch (.pt) 模型 - 自动推断网络结构")
+    print(f"  策略路径: {policy_path}")
+    print(f"  XML路径: {xml_path}")
     print("-" * 50)
 
     policy_controller = None
@@ -739,6 +883,7 @@ if __name__ == "__main__":
         print("\n程序被用户中断")
     except Exception as e:
         print(f"错误: {e}")
+        traceback.print_exc()
     finally:
         print("清理资源...")
         # 注意：由于viewer.launch的限制，我们无法直接访问policy对象
